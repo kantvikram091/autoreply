@@ -18,7 +18,6 @@ GEMINI_KEY     = os.getenv('GEMINI_KEY')
 MAIN_BOT_TOKEN = os.getenv('MAIN_BOT_TOKEN')
 
 genai.configure(api_key=GEMINI_KEY)
-gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 
 OFFLINE_THRESHOLD = 300  # 5 minutes
 
@@ -64,7 +63,7 @@ def notify_seller(seller_id, text):
     except Exception as e:
         print(f"[notify] Error: {e}")
 
-# ── ONLINE TRACKER ──────────────────────────────────────────────────
+# ── ONLINE TRACKER ───────────────────────────────────────────────────
 
 class OnlineTracker:
     def __init__(self):
@@ -81,9 +80,10 @@ class OnlineTracker:
 
 tracker = OnlineTracker()
 
-# ── AI REPLY ────────────────────────────────────────────────────────
-
-conversations = {}  # (seller_id, customer_id) → Gemini chat session
+# ── AI REPLY ─────────────────────────────────────────────────────────
+# Store conversation history per (seller_id, customer_id) as plain lists
+# so we can reconstruct a fresh Gemini chat each time safely
+conversation_history = {}  # (seller_id, customer_id) → list of {role, parts}
 
 DEFAULT_GREETING = (
     "Hi! 👋 Thanks for reaching out. The owner is currently unavailable, "
@@ -91,42 +91,57 @@ DEFAULT_GREETING = (
 )
 
 def build_system_prompt(biz_name, price_list, greeting_msg):
-    biz   = biz_name    or "this business"
-    pl    = price_list  or "Price list not set. Tell the customer the owner will share details soon."
+    biz   = biz_name     or "this business"
+    pl    = price_list   or "Price list not available. Tell the customer the owner will share details soon."
     greet = greeting_msg or DEFAULT_GREETING
     return (
-        f"You are a professional AI assistant for {biz}. "
-        f"Your job is to help customers while the owner is away.\n\n"
-        f"GREETING (use this for first message): {greet}\n\n"
-        f"PRICE LIST:\n{pl}\n\n"
+        f"You are a professional AI sales assistant for {biz}. "
+        f"The owner is currently offline and you handle customer inquiries.\n\n"
+        f"YOUR GREETING for first-time customers: {greet}\n\n"
+        f"PRICE LIST (use ONLY these prices, never make up prices):\n{pl}\n\n"
         f"RULES:\n"
-        f"- Be friendly, professional, and concise\n"
-        f"- If a service isn't in the price list, say the owner will follow up\n"
-        f"- Never make up prices\n"
-        f"- Keep replies under 150 words\n"
-        f"- Use light emojis naturally"
+        f"- Always greet first-time customers warmly\n"
+        f"- Answer price questions using ONLY the price list above\n"
+        f"- If asked about something not in the price list, say the owner will follow up\n"
+        f"- Be concise, friendly, and professional\n"
+        f"- Use 1-2 emojis per message naturally\n"
+        f"- Keep replies under 120 words"
     )
 
-# ✅ FIX: pure async — no asyncio.run() inside event loop
+def call_gemini_sync(system_prompt, history, new_message):
+    """
+    Synchronous Gemini call — safe to run in executor.
+    Creates a fresh model instance each time with full history.
+    """
+    model = genai.GenerativeModel(
+        model_name="gemini-1.5-flash",
+        system_instruction=system_prompt   # ← system prompt via system_instruction
+    )
+    chat = model.start_chat(history=history)
+    response = chat.send_message(new_message)
+    return response.text, chat.history  # return updated history too
+
 async def get_ai_reply(seller_id, customer_id, user_text, biz_name, price_list, greeting_msg):
-    key    = (seller_id, customer_id)
-    system = build_system_prompt(biz_name, price_list, greeting_msg)
+    key           = (seller_id, customer_id)
+    system_prompt = build_system_prompt(biz_name, price_list, greeting_msg)
+    history       = conversation_history.get(key, [])
 
     loop = asyncio.get_event_loop()
 
-    if key not in conversations:
-        conversations[key] = gemini_model.start_chat(history=[])
-        msg = f"[System: {system}]\n\nCustomer's first message: {user_text}"
-    else:
-        msg = user_text
-
-    # Run blocking Gemini call in thread executor — safe inside async
-    response = await loop.run_in_executor(
-        None, conversations[key].send_message, msg
+    # Run blocking Gemini call safely in thread pool
+    reply_text, updated_history = await loop.run_in_executor(
+        None,
+        call_gemini_sync,
+        system_prompt,
+        history,
+        user_text
     )
-    return response.text
 
-# ── SELLER SESSION ──────────────────────────────────────────────────
+    # Save updated history
+    conversation_history[key] = updated_history
+    return reply_text
+
+# ── SELLER SESSION ───────────────────────────────────────────────────
 
 active_clients = {}
 
@@ -147,27 +162,25 @@ async def run_seller_session(seller_row):
     try:
         await client.connect()
         if not await client.is_user_authorized():
-            print(f"[!] Seller {seller_id} session expired")
+            print(f"[!] Seller {seller_id} session expired — skipping")
             return
 
         me = await client.get_me()
         active_clients[seller_id] = client
-        print(f"[✓] Seller {seller_id} ({me.first_name}) is live")
+        print(f"[✓] Seller {seller_id} ({me.first_name}) session live")
 
-        # Detect seller sending messages → mark online
         @client.on(events.NewMessage(outgoing=True))
         async def outgoing(event):
             tracker.mark_active(seller_id)
 
-        # Detect seller opening app → mark online
         @client.on(events.UserUpdate())
         async def user_update(event):
             if hasattr(event, 'status') and isinstance(event.status, types.UserStatusOnline):
                 tracker.mark_active(seller_id)
 
-        # Handle incoming DMs
         @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
         async def on_incoming(event):
+            # Fresh config from DB every message
             cfg = get_seller_config(seller_id)
             if not cfg:
                 return
@@ -180,10 +193,8 @@ async def run_seller_session(seller_row):
                 return
             if not auto_reply_on:
                 return
-
-            # Skip if seller is online
             if tracker.is_online(seller_id):
-                print(f"[~] Seller {seller_id} is online — skipping auto-reply")
+                print(f"[~] Seller {seller_id} online — skipping")
                 return
 
             user_text = event.message.text
@@ -195,22 +206,23 @@ async def run_seller_session(seller_row):
             customer_name  = (getattr(sender, 'first_name', '') or '').strip() or "Customer"
             customer_uname = getattr(sender, 'username', '') or ''
 
-            print(f"[→] {seller_id} ← {customer_name}: {user_text[:60]}")
+            print(f"[→] {customer_name}: {user_text[:80]}")
 
             try:
-                # ✅ FIX: direct await — no nested asyncio.run()
-                reply = await asyncio.wait_for(
-                    get_ai_reply(seller_id, customer_id, user_text, biz, pl, greet),
-                    timeout=20
-                )
+                async with client.action(event.chat_id, 'typing'):
+                    reply = await asyncio.wait_for(
+                        get_ai_reply(seller_id, customer_id, user_text, biz, pl, greet),
+                        timeout=25
+                    )
             except asyncio.TimeoutError:
-                reply = f"Hi! 👋 Thanks for contacting {biz or 'us'}. The owner is busy right now and will get back to you shortly!"
+                print(f"[!] Gemini timeout for seller {seller_id}")
+                reply = f"Hi! 👋 Thanks for contacting {biz or 'us'}. The owner will get back to you shortly!"
             except Exception as e:
                 print(f"[!] Gemini error: {e}")
-                reply = f"Hi! 👋 Thanks for reaching out to {biz or 'us'}. The owner will follow up with you soon!"
+                reply = f"Hi! 👋 Thanks for reaching out to {biz or 'us'}. We'll get back to you soon!"
 
             await event.reply(reply)
-            print(f"[←] Replied to {customer_name}")
+            print(f"[←] Sent: {reply[:80]}")
 
             save_lead(seller_id, customer_id, customer_name, customer_uname, user_text, reply)
 
@@ -218,8 +230,8 @@ async def run_seller_session(seller_row):
                 f"📩 <b>New Lead!</b>\n\n"
                 f"👤 <b>{customer_name}</b>"
                 f"{' (@' + customer_uname + ')' if customer_uname else ''}\n\n"
-                f"💬 {user_text[:200]}\n\n"
-                f"🤖 {reply[:200]}")
+                f"💬 <b>Customer:</b> {user_text[:200]}\n\n"
+                f"🤖 <b>Bot replied:</b> {reply[:200]}")
 
         await client.run_until_disconnected()
 
@@ -229,28 +241,24 @@ async def run_seller_session(seller_row):
         active_clients.pop(seller_id, None)
         print(f"[-] Seller {seller_id} session ended")
 
-# ── WATCHDOG ────────────────────────────────────────────────────────
+# ── WATCHDOG ─────────────────────────────────────────────────────────
 
 async def watchdog():
     print("✓ Watchdog started")
-    # ✅ FIX: run immediately on start, not after 60s wait
     while True:
         try:
             sellers = get_all_active_sellers()
-            print(f"[watchdog] Found {len(sellers)} active seller(s)")
+            print(f"[watchdog] {len(sellers)} active seller(s)")
             for seller in sellers:
-                sid = seller[0]
-                if sid not in active_clients:
+                if seller[0] not in active_clients:
                     asyncio.create_task(run_seller_session(seller))
 
-            # Clean expired sessions
             now = datetime.now()
             for sid in list(active_clients.keys()):
                 cfg = get_seller_config(sid)
                 if not cfg or not cfg[4]:
                     continue
                 if now >= datetime.strptime(cfg[4], '%Y-%m-%d %H:%M:%S'):
-                    print(f"[x] Seller {sid} expired — closing")
                     try:
                         await active_clients[sid].disconnect()
                     except: pass
@@ -259,7 +267,7 @@ async def watchdog():
         except Exception as e:
             print(f"[watchdog] Error: {e}")
 
-        await asyncio.sleep(30)  # ✅ check every 30s instead of 60s
+        await asyncio.sleep(30)
 
 async def main():
     print("✓ Uzeron ReplyBot Worker starting...")
