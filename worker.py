@@ -1,14 +1,9 @@
 # -*- coding: utf-8 -*-
-"""
-worker.py — Uzeron ReplyBot Worker
-Runs one Telethon userbot per seller.
-Auto-detects online/offline via last_seen and typing status.
-"""
 import os
 import asyncio
 import psycopg2
-from datetime import datetime, timedelta
-from telethon import TelegramClient, events, functions, types
+from datetime import datetime
+from telethon import TelegramClient, events, types
 from telethon.sessions import StringSession
 import google.generativeai as genai
 import requests
@@ -25,12 +20,9 @@ MAIN_BOT_TOKEN = os.getenv('MAIN_BOT_TOKEN')
 genai.configure(api_key=GEMINI_KEY)
 gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 
-# ── How long without activity before considered "offline" (seconds)
-OFFLINE_THRESHOLD = 300   # 5 minutes
+OFFLINE_THRESHOLD = 300  # 5 minutes
 
-# ════════════════════════════════════════════
-# DATABASE
-# ════════════════════════════════════════════
+# ── DB ──────────────────────────────────────────────────────────────
 
 def get_conn():
     return psycopg2.connect(DATABASE_URL, sslmode='require')
@@ -64,7 +56,6 @@ def save_lead(seller_id, customer_id, name, username, message, reply):
     conn.commit(); conn.close()
 
 def notify_seller(seller_id, text):
-    """Send a Telegram message to the seller via the main bot."""
     try:
         requests.post(
             f"https://api.telegram.org/bot{MAIN_BOT_TOKEN}/sendMessage",
@@ -73,35 +64,26 @@ def notify_seller(seller_id, text):
     except Exception as e:
         print(f"[notify] Error: {e}")
 
-# ════════════════════════════════════════════
-# ONLINE DETECTION
-# ════════════════════════════════════════════
+# ── ONLINE TRACKER ──────────────────────────────────────────────────
 
 class OnlineTracker:
-    """
-    Tracks whether the seller is online.
-    We consider them online if they sent a message or read/typed within OFFLINE_THRESHOLD seconds.
-    The userbot listens to its own outgoing messages to detect activity.
-    """
     def __init__(self):
-        self.last_activity: dict[int, datetime] = {}  # seller_id → last active time
+        self.last_activity = {}
 
-    def mark_active(self, seller_id: int):
+    def mark_active(self, seller_id):
         self.last_activity[seller_id] = datetime.now()
 
-    def is_online(self, seller_id: int) -> bool:
+    def is_online(self, seller_id):
         last = self.last_activity.get(seller_id)
         if last is None:
-            return False  # never seen → treat as offline (safe to reply)
+            return False
         return (datetime.now() - last).total_seconds() < OFFLINE_THRESHOLD
 
 tracker = OnlineTracker()
 
-# ════════════════════════════════════════════
-# AI REPLY
-# ════════════════════════════════════════════
+# ── AI REPLY ────────────────────────────────────────────────────────
 
-conversations: dict[tuple, object] = {}  # (seller_id, customer_id) → Gemini chat
+conversations = {}  # (seller_id, customer_id) → Gemini chat session
 
 DEFAULT_GREETING = (
     "Hi! 👋 Thanks for reaching out. The owner is currently unavailable, "
@@ -109,8 +91,8 @@ DEFAULT_GREETING = (
 )
 
 def build_system_prompt(biz_name, price_list, greeting_msg):
-    biz   = biz_name   or "this business"
-    pl    = price_list or "Price list not set. Tell the customer the owner will share details soon."
+    biz   = biz_name    or "this business"
+    pl    = price_list  or "Price list not set. Tell the customer the owner will share details soon."
     greet = greeting_msg or DEFAULT_GREETING
     return (
         f"You are a professional AI assistant for {biz}. "
@@ -120,41 +102,43 @@ def build_system_prompt(biz_name, price_list, greeting_msg):
         f"RULES:\n"
         f"- Be friendly, professional, and concise\n"
         f"- If a service isn't in the price list, say the owner will follow up\n"
-        f"- Never make up prices — only use the price list above\n"
-        f"- End replies with a helpful follow-up question when appropriate\n"
-        f"- Keep replies under 200 words\n"
+        f"- Never make up prices\n"
+        f"- Keep replies under 150 words\n"
         f"- Use light emojis naturally"
     )
 
+# ✅ FIX: pure async — no asyncio.run() inside event loop
 async def get_ai_reply(seller_id, customer_id, user_text, biz_name, price_list, greeting_msg):
-    key = (seller_id, customer_id)
+    key    = (seller_id, customer_id)
     system = build_system_prompt(biz_name, price_list, greeting_msg)
+
+    loop = asyncio.get_event_loop()
 
     if key not in conversations:
         conversations[key] = gemini_model.start_chat(history=[])
-        first_msg = f"[System instructions: {system}]\n\nCustomer's first message: {user_text}"
-        response  = conversations[key].send_message(first_msg)
+        msg = f"[System: {system}]\n\nCustomer's first message: {user_text}"
     else:
-        response = conversations[key].send_message(user_text)
+        msg = user_text
 
+    # Run blocking Gemini call in thread executor — safe inside async
+    response = await loop.run_in_executor(
+        None, conversations[key].send_message, msg
+    )
     return response.text
 
-# ════════════════════════════════════════════
-# SELLER SESSION RUNNER
-# ════════════════════════════════════════════
+# ── SELLER SESSION ──────────────────────────────────────────────────
 
-active_clients: dict[int, TelegramClient] = {}
+active_clients = {}
 
 async def run_seller_session(seller_row):
     (seller_id, session_str, price_list, biz_name,
      greeting_msg, auto_reply, expiry, seller_api_id, seller_api_hash) = seller_row
 
     if seller_id in active_clients:
-        return  # already running
+        return
 
     print(f"[+] Starting session for seller {seller_id}")
 
-    # Use seller's own API creds if available, else fall back to bot's
     use_api_id   = seller_api_id   or API_ID
     use_api_hash = seller_api_hash or API_HASH
 
@@ -163,47 +147,43 @@ async def run_seller_session(seller_row):
     try:
         await client.connect()
         if not await client.is_user_authorized():
-            print(f"[!] Seller {seller_id} session expired — skipping")
+            print(f"[!] Seller {seller_id} session expired")
             return
 
         me = await client.get_me()
         active_clients[seller_id] = client
-        print(f"[✓] Seller {seller_id} ({me.first_name}) session active")
+        print(f"[✓] Seller {seller_id} ({me.first_name}) is live")
 
-        # ── Detect outgoing messages → seller is online ──────────
+        # Detect seller sending messages → mark online
         @client.on(events.NewMessage(outgoing=True))
-        async def outgoing_handler(event):
+        async def outgoing(event):
             tracker.mark_active(seller_id)
 
-        # ── Detect UserStatus updates (when seller opens the app) ─
+        # Detect seller opening app → mark online
         @client.on(events.UserUpdate())
         async def user_update(event):
             if hasattr(event, 'status') and isinstance(event.status, types.UserStatusOnline):
                 tracker.mark_active(seller_id)
 
-        # ── Handle incoming private messages ──────────────────────
+        # Handle incoming DMs
         @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
         async def on_incoming(event):
-            # Re-fetch config fresh from DB
             cfg = get_seller_config(seller_id)
             if not cfg:
                 return
 
             auto_reply_on, pl, biz, greet, sub_expiry = cfg
 
-            # Check subscription still valid
             if not sub_expiry:
                 return
             if datetime.now() >= datetime.strptime(sub_expiry, '%Y-%m-%d %H:%M:%S'):
                 return
-
-            # Check auto-reply is enabled
             if not auto_reply_on:
                 return
 
-            # ── AUTO ONLINE/OFFLINE DETECTION ────────────────────
-            # If seller was active recently → they're "online" → skip auto-reply
+            # Skip if seller is online
             if tracker.is_online(seller_id):
+                print(f"[~] Seller {seller_id} is online — skipping auto-reply")
                 return
 
             user_text = event.message.text
@@ -212,72 +192,65 @@ async def run_seller_session(seller_row):
 
             sender         = await event.get_sender()
             customer_id    = sender.id
-            customer_name  = (getattr(sender, 'first_name', '') or '') + \
-                             (' ' + getattr(sender, 'last_name', '') if getattr(sender, 'last_name', '') else '')
-            customer_name  = customer_name.strip() or "Customer"
+            customer_name  = (getattr(sender, 'first_name', '') or '').strip() or "Customer"
             customer_uname = getattr(sender, 'username', '') or ''
 
-            print(f"[→] Seller {seller_id} ← {customer_name}: {user_text[:60]}")
+            print(f"[→] {seller_id} ← {customer_name}: {user_text[:60]}")
 
-            # Show typing indicator
-            async with client.action(event.chat_id, 'typing'):
-                try:
-                    reply = await asyncio.wait_for(
-                        asyncio.get_event_loop().run_in_executor(
-                            None,
-                            lambda: asyncio.run(get_ai_reply(
-                                seller_id, customer_id, user_text, biz, pl, greet))),
-                        timeout=15)
-                except Exception:
-                    # Fallback reply
-                    reply = (f"Hi! 👋 Thanks for reaching out to {biz or 'us'}. "
-                             f"The owner is currently busy. "
-                             f"I'll make sure they get back to you shortly!")
+            try:
+                # ✅ FIX: direct await — no nested asyncio.run()
+                reply = await asyncio.wait_for(
+                    get_ai_reply(seller_id, customer_id, user_text, biz, pl, greet),
+                    timeout=20
+                )
+            except asyncio.TimeoutError:
+                reply = f"Hi! 👋 Thanks for contacting {biz or 'us'}. The owner is busy right now and will get back to you shortly!"
+            except Exception as e:
+                print(f"[!] Gemini error: {e}")
+                reply = f"Hi! 👋 Thanks for reaching out to {biz or 'us'}. The owner will follow up with you soon!"
 
             await event.reply(reply)
-            print(f"[←] Bot replied to {customer_name}")
+            print(f"[←] Replied to {customer_name}")
 
-            # Save lead
             save_lead(seller_id, customer_id, customer_name, customer_uname, user_text, reply)
 
-            # Notify seller
             notify_seller(seller_id,
                 f"📩 <b>New Lead!</b>\n\n"
                 f"👤 <b>{customer_name}</b>"
                 f"{' (@' + customer_uname + ')' if customer_uname else ''}\n\n"
-                f"💬 <b>They asked:</b>\n{user_text[:300]}\n\n"
-                f"🤖 <b>Bot replied:</b>\n{reply[:300]}")
+                f"💬 {user_text[:200]}\n\n"
+                f"🤖 {reply[:200]}")
 
         await client.run_until_disconnected()
 
     except Exception as e:
-        print(f"[!] Session error for seller {seller_id}: {e}")
+        print(f"[!] Session error seller {seller_id}: {e}")
     finally:
         active_clients.pop(seller_id, None)
         print(f"[-] Seller {seller_id} session ended")
 
-# ════════════════════════════════════════════
-# WATCHDOG — polls DB every 60s
-# ════════════════════════════════════════════
+# ── WATCHDOG ────────────────────────────────────────────────────────
 
 async def watchdog():
-    print("✓ Worker watchdog started")
+    print("✓ Watchdog started")
+    # ✅ FIX: run immediately on start, not after 60s wait
     while True:
         try:
             sellers = get_all_active_sellers()
+            print(f"[watchdog] Found {len(sellers)} active seller(s)")
             for seller in sellers:
                 sid = seller[0]
                 if sid not in active_clients:
                     asyncio.create_task(run_seller_session(seller))
 
-            # Clean up expired sessions
+            # Clean expired sessions
             now = datetime.now()
             for sid in list(active_clients.keys()):
                 cfg = get_seller_config(sid)
                 if not cfg or not cfg[4]:
                     continue
                 if now >= datetime.strptime(cfg[4], '%Y-%m-%d %H:%M:%S'):
-                    print(f"[x] Seller {sid} subscription expired — closing session")
+                    print(f"[x] Seller {sid} expired — closing")
                     try:
                         await active_clients[sid].disconnect()
                     except: pass
@@ -286,7 +259,7 @@ async def watchdog():
         except Exception as e:
             print(f"[watchdog] Error: {e}")
 
-        await asyncio.sleep(60)
+        await asyncio.sleep(30)  # ✅ check every 30s instead of 60s
 
 async def main():
     print("✓ Uzeron ReplyBot Worker starting...")
