@@ -22,7 +22,7 @@ OFFLINE_THRESHOLD = 300  # 5 min
 
 def gemini_reply(system_prompt, history, user_text):
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-           f"gemini-1.5-flash:generateContent?key={GEMINI_KEY}")
+           f"gemini-2.0-flash:generateContent?key={GEMINI_KEY}")
 
     contents = list(history)
     contents.append({"role": "user", "parts": [{"text": user_text}]})
