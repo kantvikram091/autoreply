@@ -4,4 +4,3 @@ requests
 cryptg
 pytz
 psycopg2-binary
-google-generativeai
