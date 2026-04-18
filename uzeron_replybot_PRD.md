@@ -168,7 +168,7 @@ Shows full system snapshot:
 
 **Step 3 — OTP**
 - Bot asks seller to enter the OTP they received
-- Seller types the OTP as plain text (no button needed)
+- Seller types the OTP on buttons (inbuild like used in starting for join the groups)
 - Bot signs in with OTP
 
 **Step 3b — 2FA (if enabled)**
